@@ -30,6 +30,71 @@
 #include <utility>
 #include <type_traits>
 
+// ---------------------------------------------------------------------------
+// AVX2 auto-detection
+// ---------------------------------------------------------------------------
+// The original code gated its 256-bit path on JM_XORSTR_DISABLE_AVX_INTRINSICS
+// and used it by default. That path calls _mm256_xor_si256, which is an AVX2
+// intrinsic (AVX1 only added 256-bit float/double ops, not integer ones), so
+// building this header with default flags on an AVX-only CPU (e.g. Sandy
+// Bridge / Ivy Bridge, like an i5-2400) would compile fine but crash at
+// runtime with SIGILL, unless the user manually opted out.
+//
+// Since this is a compile-time/inlined template library, "does the target
+// have AVX2" is decided at compile time by the compiler flags you build
+// with (-mavx2 / -march=native / -march=haswell-or-later on GCC/Clang,
+// /arch:AVX2 on MSVC). All of these define the __AVX2__ macro for you, so
+// we detect that instead of assuming AVX2 is present.
+//
+//   * Build normally (no -mavx2)      -> falls back to SSE, safe on any x86-64 CPU.
+//   * Build with -mavx2 / -march=native on an AVX2-capable machine
+//                                      -> automatically takes the faster 256-bit path.
+//   * JM_XORSTR_DISABLE_AVX_INTRINSICS -> force SSE regardless of __AVX2__.
+//   * JM_XORSTR_FORCE_AVX2             -> force the AVX2 path regardless of
+//                                         __AVX2__ (only for testing on a
+//                                         known-AVX2 machine; will SIGILL if
+//                                         the CPU actually lacks AVX2).
+#if defined(JM_XORSTR_DISABLE_AVX_INTRINSICS)
+#   define JM_XORSTR_USE_AVX2 0
+#elif defined(JM_XORSTR_FORCE_AVX2)
+#   define JM_XORSTR_USE_AVX2 1
+#elif defined(__AVX2__)
+#   define JM_XORSTR_USE_AVX2 1
+#else
+#   define JM_XORSTR_USE_AVX2 0
+#endif
+
+// ---------------------------------------------------------------------------
+// True runtime CPU dispatch (GCC/Clang, x86/x86-64 only)
+// ---------------------------------------------------------------------------
+// Everything above decides AVX2 usage at *compile* time, from the flags you
+// built with. That means a binary built without -mavx2 never uses AVX2 even
+// on a machine that has it, and a binary built with -mavx2 will crash with
+// SIGILL if it's ever run on a machine without AVX2 (e.g. an i5-2400).
+//
+// If you want a single binary that runs correctly on both, and automatically
+// takes the faster AVX2 path only on CPUs that actually support it, that
+// needs a *runtime* check (CPUID) plus two compiled versions of the XOR
+// routine. GCC and Clang support this via per-function `target("avx2")`
+// attributes (function multiversioning) — the AVX2 version can be compiled
+// into the binary without needing a blanket -mavx2 for the whole file, and
+// you choose which one runs via __builtin_cpu_supports at runtime.
+//
+// This is only available for GCC/Clang on x86/x86-64; MSVC has no equivalent
+// per-function target attribute (its AVX2 intrinsics require /arch:AVX2 for
+// the whole translation unit), so on MSVC this falls back to the compile-time
+// JM_XORSTR_USE_AVX2 decision above. ARM doesn't need this at all: NEON is a
+// mandatory baseline feature on AArch64, so there's nothing to detect.
+#if (defined(_M_X64) || defined(__amd64__) || defined(_M_IX86) || defined(__i386__)) \
+    && (defined(__GNUC__) || defined(__clang__)) \
+    && !defined(JM_XORSTR_DISABLE_AVX_INTRINSICS) \
+    && !defined(JM_XORSTR_FORCE_AVX2) \
+    && !defined(JM_XORSTR_DISABLE_RUNTIME_DISPATCH)
+#   define JM_XORSTR_RUNTIME_DISPATCH 1
+#else
+#   define JM_XORSTR_RUNTIME_DISPATCH 0
+#endif
+
 #define xorstr(str) ::jm::xor_string([]() { return str; }, std::integral_constant<std::size_t, sizeof(str) / sizeof(*str)>{}, std::make_index_sequence<::jm::detail::_buffer_size<sizeof(str)>()>{})
 #define xorstr_(str) xorstr(str).crypt_get()
 
@@ -96,6 +161,67 @@ namespace jm {
 #endif
         }
 
+#if JM_XORSTR_RUNTIME_DISPATCH
+
+        // Checked once (function-local static init is thread-safe in C++11+)
+        // and cheap on every call after that - just a load of a cached bool.
+        inline bool cpu_has_avx2() noexcept
+        {
+            static const bool result = []() noexcept {
+                __builtin_cpu_init();
+                return __builtin_cpu_supports("avx2") != 0;
+            }();
+            return result;
+        }
+
+        // Compiled with AVX2 codegen enabled for just this function, even
+        // though the rest of the translation unit is not built with -mavx2.
+        // Handles any even element count (the storage/keys arrays this
+        // library generates are always sized in multiples of 2 uint64_t's).
+        __attribute__((target("avx2")))
+        inline void xor_buffer_avx2(std::uint64_t*       storage,
+                                     const std::uint64_t* keys,
+                                     std::size_t          count64) noexcept
+        {
+            std::size_t i = 0;
+            for(; i + 4 <= count64; i += 4) {
+                __m256i s = _mm256_load_si256(reinterpret_cast<const __m256i*>(storage + i));
+                __m256i k = _mm256_load_si256(reinterpret_cast<const __m256i*>(keys + i));
+                _mm256_store_si256(reinterpret_cast<__m256i*>(storage + i), _mm256_xor_si256(s, k));
+            }
+            if(i + 2 <= count64) {
+                __m128i s = _mm_load_si128(reinterpret_cast<const __m128i*>(storage + i));
+                __m128i k = _mm_load_si128(reinterpret_cast<const __m128i*>(keys + i));
+                _mm_store_si128(reinterpret_cast<__m128i*>(storage + i), _mm_xor_si128(s, k));
+            }
+        }
+
+        // Baseline path: plain SSE2, guaranteed available on every x86-64 CPU
+        // (including AVX-only ones like an i5-2400), no special target needed.
+        inline void xor_buffer_sse(std::uint64_t*       storage,
+                                    const std::uint64_t* keys,
+                                    std::size_t          count64) noexcept
+        {
+            std::size_t i = 0;
+            for(; i + 2 <= count64; i += 2) {
+                __m128i s = _mm_load_si128(reinterpret_cast<const __m128i*>(storage + i));
+                __m128i k = _mm_load_si128(reinterpret_cast<const __m128i*>(keys + i));
+                _mm_store_si128(reinterpret_cast<__m128i*>(storage + i), _mm_xor_si128(s, k));
+            }
+        }
+
+        XORSTR_FORCEINLINE void xor_buffer_dispatch(std::uint64_t*       storage,
+                                                      const std::uint64_t* keys,
+                                                      std::size_t          count64) noexcept
+        {
+            if(cpu_has_avx2())
+                xor_buffer_avx2(storage, keys, count64);
+            else
+                xor_buffer_sse(storage, keys, count64);
+        }
+
+#endif // JM_XORSTR_RUNTIME_DISPATCH
+
     } // namespace detail
 
     template<class CharT, std::size_t Size, class Keys, class Indices>
@@ -103,7 +229,7 @@ namespace jm {
 
     template<class CharT, std::size_t Size, std::uint64_t... Keys, std::size_t... Indices>
     class xor_string<CharT, Size, std::integer_sequence<std::uint64_t, Keys...>, std::index_sequence<Indices...>> {
-#ifndef JM_XORSTR_DISABLE_AVX_INTRINSICS
+#if JM_XORSTR_RUNTIME_DISPATCH || JM_XORSTR_USE_AVX2
         constexpr static inline std::uint64_t alignment = ((Size > 16) ? 32 : 16);    
 #else
         constexpr static inline std::uint64_t alignment = 16;
@@ -152,7 +278,9 @@ namespace jm {
                         veorq_u64(vld1q_u64(reinterpret_cast<const uint64_t*>(_storage) + Indices * 2),
                                   vld1q_u64(reinterpret_cast<const uint64_t*>(keys) + Indices * 2)))), ...);
 #endif
-#elif !defined(JM_XORSTR_DISABLE_AVX_INTRINSICS)
+#elif JM_XORSTR_RUNTIME_DISPATCH
+            ::jm::detail::xor_buffer_dispatch(_storage, keys, sizeof...(Keys));
+#elif JM_XORSTR_USE_AVX2
             ((Indices >= sizeof(_storage) / 32 ? static_cast<void>(0) : _mm256_store_si256(
                 reinterpret_cast<__m256i*>(_storage) + Indices,
                 _mm256_xor_si256(
@@ -207,7 +335,9 @@ namespace jm {
                         veorq_u64(vld1q_u64(reinterpret_cast<const uint64_t*>(_storage) + Indices * 2),
                                   vld1q_u64(reinterpret_cast<const uint64_t*>(keys) + Indices * 2)))), ...);
 #endif
-#elif !defined(JM_XORSTR_DISABLE_AVX_INTRINSICS)
+#elif JM_XORSTR_RUNTIME_DISPATCH
+            ::jm::detail::xor_buffer_dispatch(_storage, keys, sizeof...(Keys));
+#elif JM_XORSTR_USE_AVX2
             ((Indices >= sizeof(_storage) / 32 ? static_cast<void>(0) : _mm256_store_si256(
                 reinterpret_cast<__m256i*>(_storage) + Indices,
                 _mm256_xor_si256(
